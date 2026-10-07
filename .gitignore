@@ -3,3 +3,7 @@ abc.history
 
 #Directories
 output/
+
+# Build outputs
+build/
+*.vcd
