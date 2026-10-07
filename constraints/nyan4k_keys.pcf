@@ -1,11 +1,11 @@
 # Clocks
 set_io -pullup no   clk_g_i       21  #12 Mhz clk
 
-# Interface - SPI Slave Mode 1 (CPOL=0 CPHA=1)
-set_io -pullup no  rstn_g_i       28  #FPGA Reset
-set_io -pullup no  spi_mosi_g_o   29  #SDO (Master Out Slave In)
-set_io -pullup no  spi_keys_ack   31  #SPI Keys IP Acknowledgement.
-set_io -pullup no  spi_clk_g_o    32  #SCL (SPI Clock Line)
+# Interface - SPI Master Mode 0 (CPOL=0 CPHA=0), no chip select
+set_io -pullup no  rstn_g_i       28  #FPGA Reset (STM32 PC0)
+set_io -pullup no  spi_mosi_g_o   29  #SDO (Master Out Slave In) (STM32 PC1 SPI2_MOSI)
+set_io -pullup no  spi_keys_ack   31  #Frame ack, rising edge (STM32 PC2)
+set_io -pullup no  spi_clk_g_o    32  #SCL (SPI Clock Line) (STM32 PB10 SPI2_SCK)
 
 # Key Switches
 set_io -pullup yes keys_i_g[0]    1   #ESC

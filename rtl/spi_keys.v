@@ -1,10 +1,29 @@
 /**
  * @auth: Reese Russell
  * @date: 10/10/23
- * @desc: keys -> spi registers
+ * @desc: keys -> debounce -> SPI frame push to the MCU
+ *
+ * Protocol (FPGA is the SPI master, MCU is an RX-only SPI slave):
+ *  - Frame: [0xA5] [keys 7:0] [keys 15:8] ... [keys 63:56] [CRC-8], 80 bits
+ *    back-to-back, mode 0, MSB first. Unused pad bits are 1 (released).
+ *  - A frame is sent as soon as the debounced key state differs from the last
+ *    frame sent, right after reset, every REFRESH_CYCLES, and again if the MCU
+ *    does not ack within ACK_TIMEOUT_CYCLES.
+ *  - After a frame the FPGA waits for a rising edge on spi_keys_ack. The edge
+ *    is captured asynchronously, so pulses of any width are seen. Edges that
+ *    arrive while a frame is being sent are ignored.
+ *
+ * Everything runs on the 78MHz PLL clock - a single clock domain.
  */
 
-module spi_keys #(parameter NUM_KEYS = 61) (
+module spi_keys #(
+    parameter NUM_KEYS           = 61,
+    parameter DEBOUNCE_PRESCALE  = 8192,     // clocks per debounce tick (105us @ 78MHz)
+    parameter DEBOUNCE_TICKS     = 127,      // ~13.3ms @ 78MHz
+    parameter REFRESH_CYCLES     = 3900000,  // 50ms @ 78MHz
+    parameter ACK_TIMEOUT_CYCLES = 78000,    // 1ms @ 78MHz, measured from frame start
+    parameter HALF_BIT_CLKS      = 2         // SCLK = 78MHz / 4 = 19.5MHz
+    ) (
     // Globals
     input  wire clk_g_i,
     input  wire rstn_g_i,
@@ -18,68 +37,36 @@ module spi_keys #(parameter NUM_KEYS = 61) (
     input wire [NUM_KEYS-1:0] keys_i_g
     );
 
-    // Register group properties, groups can not be more than 512
-    localparam GROUPS       = (NUM_KEYS + 7) / 8;
-    localparam GROUPS_PAD   = (NUM_KEYS % 8);
-    localparam GROUPS_WIDTH = $clog2(GROUPS);
-    localparam KEYS_PAD     = (GROUPS_PAD == 0) ? NUM_KEYS : NUM_KEYS + (8 - GROUPS_PAD);
+    localparam DATA_BYTES = (NUM_KEYS + 7) / 8;
+    localparam KEYS_PAD   = DATA_BYTES * 8;
+    localparam CNT_MAX    = (REFRESH_CYCLES > ACK_TIMEOUT_CYCLES) ? REFRESH_CYCLES : ACK_TIMEOUT_CYCLES;
+    localparam CNT_W      = $clog2(CNT_MAX + 1);
 
-    // Internal clocks
-    wire        clk_g_int;
-    wire        clk_g_int_buf;
-    wire        sdo_int;
-    wire        spi_tx_ready;
+    localparam S_IDLE = 2'd0;
+    localparam S_SEND = 2'd1;
+    localparam S_WAIT = 2'd2;
 
-    // Internal routes
-    wire [NUM_KEYS-1:0]          keys;
-    wire [KEYS_PAD-NUM_KEYS-1:0] keys_pad_bits;
-    wire [KEYS_PAD-1:0]          keys_pad = {keys_pad_bits, keys_prv};
-    wire [7:0]                   keys_mux;
-    wire                         pll_locked;
+    wire                clk;
+    wire                pll_locked;
+    wire [NUM_KEYS-1:0] keys;
+    wire                tx_done;
 
-    // Internal registers
-    reg [GROUPS_WIDTH-1:0]  groups_select;
-    reg [NUM_KEYS-1:0]      keys_prv;
-    reg                     spi_tx_valid;
-    reg                     spi_tx_lock;
-
-    // Keyboard keys interface - 92 MHZ/
-    keys #(NUM_KEYS) keys_interface (
-        .clk_i   (clk_g_i),
-        .rst_n_i (rstn_g_i),
-        .keys_i  (keys_i_g),
-        .keys_o  (keys)
-    );
-
-    // SPI module - Master
-    SPI_Master #(
-        .SPI_MODE(0),
-        .CLKS_PER_HALF_BIT(2)
-    ) nyan_keys_spi (
-        .i_Rst_L   (rstn_g_i),
-        .i_Clk     (clk_g_int_buf),
-        .i_TX_Byte (keys_mux),
-        .i_TX_DV   (spi_tx_valid),
-        .o_TX_Ready(spi_tx_ready),
-        .o_RX_DV   (),
-        .o_SPI_Clk (spi_clk_g_o),
-        .i_SPI_MISO(1'b0),
-        .o_SPI_MOSI(spi_mosi_g_o)
-    );
+    reg  [1:0]          state;
+    reg  [NUM_KEYS-1:0] keys_sent;
+    reg                 force_send;
+    reg  [CNT_W-1:0]    since_start;
 
     /**
-     * Simulation Conditions
+     * Clocking
      */
     `ifdef __ICARUS__
-        /**
-         * Simulation bypass PLL - Since no models are available
-         */
-        assign clk_g_int_buf = clk_g_i;
-        assign pll_locked = rstn_g_i;
+        // Simulation bypass PLL - Since no models are available
+        assign clk        = clk_g_i;
+        assign pll_locked = 1'b1;
     `else
-        /**
-         * Core clock generation - 78MHZ
-         */
+        wire clk_pll;
+
+        // Core clock generation - 12MHz * 52 / 8 = 78MHz
         SB_PLL40_CORE #(
             .FEEDBACK_PATH("SIMPLE"),
             .DIVR(4'b0000),       // DIVR =  0
@@ -91,169 +78,141 @@ module spi_keys #(parameter NUM_KEYS = 61) (
             .RESETB(1'b1),
             .BYPASS(1'b0),
             .REFERENCECLK(clk_g_i),
-            .PLLOUTGLOBAL(clk_g_int)
+            .PLLOUTGLOBAL(clk_pll)
         );
 
         // Buffer the output of the pll before use.
         SB_GB pll_fabric_buffer(
-            .USER_SIGNAL_TO_GLOBAL_BUFFER(clk_g_int),
-            .GLOBAL_BUFFER_OUTPUT(clk_g_int_buf)
+            .USER_SIGNAL_TO_GLOBAL_BUFFER(clk_pll),
+            .GLOBAL_BUFFER_OUTPUT(clk)
         );
     `endif
 
     /**
-     * Key Refresh Circuit
-     *  - This is the key refresh cycle, essentially it forces the
-     *    statemachine to obtain a new set of keys regardless of if a change
-     *    in the keys_o has occoured. This is infrequent enough to not impact
-     *    latency but at the same time is frequent enough to feel responsive
-     *    and 
+     * Reset synchronizer - asserts asynchronously, releases synchronously,
+     * and holds the core in reset until the PLL has locked.
      */
-    reg [22:0] refresh_counter;
-    localparam refresh_cnt = 22'd3900000;
+    reg [1:0] rst_sync;
+    wire      rstn = rst_sync[1];
 
-    always @(posedge clk_g_int_buf or negedge rstn_g_i) begin
-        if (!rstn_g_i) begin
-            refresh_counter <= 1'b0;
+    always @(posedge clk or negedge rstn_g_i) begin
+        if (!rstn_g_i)        rst_sync <= 2'b00;
+        else if (!pll_locked) rst_sync <= 2'b00;
+        else                  rst_sync <= {rst_sync[0], 1'b1};
+    end
+
+    /**
+     * Keyboard keys interface - synchronizers + eager debounce
+     */
+    keys #(
+        .keys          (NUM_KEYS),
+        .PRESCALE      (DEBOUNCE_PRESCALE),
+        .DEBOUNCE_TICKS(DEBOUNCE_TICKS)
+    ) keys_interface (
+        .clk_i   (clk),
+        .rst_n_i (rstn),
+        .keys_i  (keys_i_g),
+        .keys_o  (keys)
+    );
+
+    /**
+     * MCU ack capture
+     *  - ack_seen is clocked by the ack pin itself so a pulse of any width
+     *    sets it. It is held clear except while waiting for an ack, so an
+     *    early or stuck-high ack can never acknowledge a frame it did not see.
+     */
+    reg       ack_clr;
+    reg       ack_seen;
+    reg [1:0] ack_sync;
+
+    always @(posedge spi_keys_ack or posedge ack_clr) begin
+        if (ack_clr) ack_seen <= 1'b0;
+        else         ack_seen <= 1'b1;
+    end
+
+    always @(posedge clk or negedge rstn) begin
+        if (!rstn) begin
+            ack_clr  <= 1'b1;
+            ack_sync <= 2'b00;
         end else begin
-            if ((refresh_counter >= refresh_cnt) || (keys_changed) || (!spi_tx_ready)) begin
-                refresh_counter <= 1'b0;
-            end else begin
-                refresh_counter <= refresh_counter + 1'b1;
-            end
+            ack_clr  <= (state != S_WAIT);
+            ack_sync <= {ack_sync[0], ack_seen};
         end
     end
 
     /**
-     * MCU to Master; ACK signal
-     *  - This is meant to gate the spi connection between master and slave to
-     *    ensure the slave never desyncs from the master (Nyan Keys). This is very
-     *    important becuase of the fact that the slave does not have any
-     *    method to keep track of the order of bytes coming in. If a press is
-     *    received after a release or a release is never registered then this
-     *    will show up as a stuck key.
+     * Frame scheduler
+     *  - since_start counts clocks since the last frame started. It provides
+     *    both the ack timeout (in S_WAIT) and the periodic refresh (in S_IDLE).
+     *  - The 61-bit compare is registered to meet 78MHz (+1 clock). keys_changed
+     *    is one clock stale after keys_sent updates, but that is always inside
+     *    S_SEND, which lasts a whole frame.
      */
-    reg spi_ack;
+    reg  keys_changed;
 
-    always @(posedge clk_g_int_buf or negedge rstn_g_i) begin
-        if (rstn_g_i == 1'b0) begin
-            spi_ack <= 1'b0;
-        end else begin
-            if ((spi_keys_ack == 1'b1) && (spi_ack == 1'b0)) begin
-                spi_ack <= 1'b1;
-            end else begin
-                if ((keys_spi_state != KEY_SPI_STATE_PROCESS) && (spi_keys_ack == 1'b0)) begin
-                    spi_ack <= 1'b0;
-                end
-            end
-        end
+    always @(posedge clk or negedge rstn) begin
+        if (!rstn) keys_changed <= 1'b0;
+        else       keys_changed <= (keys != keys_sent);
     end
 
-    /**
-     * On keys change set the keys changed flag and set the keys previous
-     * state: Wait until keys cahnge again after the keys changed has been
-     * acked.
-     */
-    reg keys_changed;
+    wire want  = keys_changed || force_send || (since_start >= REFRESH_CYCLES);
+    wire start = (state == S_IDLE) && want;
 
-    always @(posedge clk_g_int_buf or negedge rstn_g_i) begin
-        if (!rstn_g_i) begin
-            keys_changed <= 1'b0;
-            keys_prv <= {NUM_KEYS{1'b1}};
+    always @(posedge clk or negedge rstn) begin
+        if (!rstn) begin
+            state       <= S_IDLE;
+            keys_sent   <= {NUM_KEYS{1'b1}};
+            force_send  <= 1'b1;            // report the initial state right away
+            since_start <= {CNT_W{1'b0}};
         end else begin
-            if (!keys_changed) begin
-                // We either wait for the keys to refresh or activate on the
-                // refresh counter
-                if((keys_prv != keys) || (refresh_counter == (refresh_cnt - 1'b1))) begin
-                    keys_prv <= keys;
-                    keys_changed <= 1'b1;
-                end
-            end else if ((keys_spi_state == KEY_SPI_STATE_DONE) && spi_tx_ready) begin;
-                keys_changed <= 1'b0;
-            end
-        end
-    end
+            if (since_start != CNT_MAX)
+                since_start <= since_start + 1'b1;
 
-    /**
-     * SPI master TX Logic - There are a few goals.
-     * 1. When the keys state changes, begin a write to the slave
-     * 2. During the slave write process lock out key state changes
-     * 3. Stop after (n) bytes have transfered over the SPI bus
-     */
-    reg [2:0] keys_spi_state;
-    reg [GROUPS_WIDTH:0] current_byte;
-
-    localparam KEY_SPI_COMPLETE_DELAY = 10'd10;
-    localparam KEY_SPI_STATE_IDLE     = 3'b000;
-    localparam KEY_SPI_STATE_ACTIVE   = 3'b001;
-    localparam KEY_SPI_STATE_SUBMIT   = 3'b010;
-    localparam KEY_SPI_STATE_PROCESS  = 3'b011;
-    localparam KEY_SPI_STATE_DONE     = 3'b100;
-
-    always @(posedge clk_g_int_buf or negedge rstn_g_i) begin
-        if (rstn_g_i == 1'b0) begin
-            keys_spi_state <= KEY_SPI_STATE_IDLE;
-            groups_select  <= 3'b000;
-            current_byte   <= 1'b0;
-            spi_tx_valid   <= 1'b0;
-            processing_cnt <= 1'b0;
-        end else begin
-            case (keys_spi_state)
-                // Waiting for a key state change to broadcast
-                KEY_SPI_STATE_IDLE: begin
-                    if (keys_changed && spi_tx_ready) begin
-                        groups_select  <= 3'b000;
-                        spi_tx_valid   <= 1'b1;
-                        spi_tx_lock    <= 1'b1;
-                        current_byte   <= 1'b0;
-                        processing_cnt <= 1'b0;
-                        keys_spi_state <= KEY_SPI_STATE_ACTIVE;
+            case (state)
+                S_IDLE: begin
+                    if (want) begin
+                        keys_sent   <= keys;
+                        force_send  <= 1'b0;
+                        since_start <= {CNT_W{1'b0}};
+                        state       <= S_SEND;
                     end
                 end
-                // Transfer is active - bulk send bytes
-                KEY_SPI_STATE_ACTIVE: begin
-                    if (spi_tx_ready) begin
-                        spi_tx_valid <= 1'b1;
-                        current_byte <= current_byte + 1'b1;
-                        keys_spi_state <= KEY_SPI_STATE_SUBMIT;
-                    end else begin
-                        spi_tx_valid <= 1'b0;
+                S_SEND: begin
+                    if (tx_done)
+                        state <= S_WAIT;
+                end
+                S_WAIT: begin
+                    if (ack_sync[1]) begin
+                        state <= S_IDLE;
+                    end else if (since_start >= ACK_TIMEOUT_CYCLES) begin
+                        force_send <= 1'b1;     // no ack - send the frame again
+                        state      <= S_IDLE;
                     end
                 end
-                // Transfer Submission Logic
-                KEY_SPI_STATE_SUBMIT: begin
-                    if (spi_tx_ready == 1'b0) begin
-                        spi_tx_valid <= 1'b0;
-                        if (current_byte < GROUPS) begin
-                            groups_select <= groups_select + 1'b1;
-                            keys_spi_state <= KEY_SPI_STATE_ACTIVE;
-                        end else begin
-                            current_byte   <= 1'b0;
-                            keys_spi_state <= KEY_SPI_STATE_PROCESS;
-                        end
-                    end
-                end
-                KEY_SPI_STATE_PROCESS: begin
-                    if (spi_ack == 1'b1) begin
-                        keys_spi_state <= KEY_SPI_STATE_DONE;
-                    end
-                end
-                KEY_SPI_STATE_DONE: begin
-                    if (spi_tx_ready && spi_ack == 1'b0) begin
-                        keys_spi_state <= KEY_SPI_STATE_IDLE;
-                    end
-                end
-                // Default cause should not be reached - If we get here just
-                // go to the default state.
-                default: begin
-                    keys_spi_state <= KEY_SPI_STATE_IDLE;
-                end
+                default: state <= S_IDLE;
             endcase
         end
     end
 
-    // Create a mux to the input of the bram
-    assign keys_mux = keys_pad[groups_select*8 +: 8];
-    assign keys_pad_bits = {KEYS_PAD-GROUPS-1{1'b0}};
+    /**
+     * SPI frame transmitter - unused pad bits are sent as 1 (released)
+     */
+    // One extra pad bit avoids a zero-width replication when NUM_KEYS is a
+    // multiple of 8; it is truncated off the top by the assignment.
+    wire [KEYS_PAD-1:0] tx_data = {{(KEYS_PAD - NUM_KEYS + 1){1'b1}}, keys};
+
+    spi_frame_tx #(
+        .DATA_BYTES   (DATA_BYTES),
+        .HALF_BIT_CLKS(HALF_BIT_CLKS)
+    ) frame_tx (
+        .clk  (clk),
+        .rst_n(rstn),
+        .start(start),
+        .data (tx_data),
+        .busy (),
+        .done (tx_done),
+        .sclk (spi_clk_g_o),
+        .mosi (spi_mosi_g_o)
+    );
 
 endmodule
